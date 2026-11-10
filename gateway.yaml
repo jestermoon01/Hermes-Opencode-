@@ -1,0 +1,22 @@
+host: 127.0.0.1
+port: 8787
+model: hermes-local
+log_file: .runtime/gateway-usage.jsonl
+connect_timeout: 5
+read_timeout: 180
+backends:
+  - name: lmstudio
+    priority: 1
+    base_url: http://127.0.0.1:1234/v1
+    health_url: http://127.0.0.1:1234/v1/models
+    api_key_env: LMSTUDIO_API_KEY
+    models:
+      hermes-local: hermes-local
+    context_limit: 65536
+    enabled: true
+# Additional authorized OpenAI-compatible backends can be added here.
+# OpenCode serve is an agent/session API, not a Chat Completions backend.
+launcher:
+  model_key: twil-8b
+  model_identifier: hermes-local
+  context_length: 65536

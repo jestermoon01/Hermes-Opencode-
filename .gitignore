@@ -1,0 +1,13 @@
+.venv/
+.uv-cache/
+.runtime/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+.env
+.tools/
+dist/
+Protoboost/
+horse-3d/
+python_skill.md
