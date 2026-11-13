@@ -4,5 +4,10 @@ alias: hermes-opencode
 model: opencode/deepseek-v4.1-flash-free
 timeout_seconds: 600
 hermes_startup_timeout_seconds: 300
+hermes_tools: true
+task_continuity: true
+automatic_model_fallback: true
+max_model_switches: 2
+fallback_models: []
 workdir: .
 log_file: .runtime/opencode-usage.jsonl

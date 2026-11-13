@@ -71,6 +71,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt")
     parser.add_argument("--gateway-only", action="store_true")
+    parser.add_argument("--resume-task")
     options = parser.parse_args()
     settings = load_agent_settings(ROOT / "opencode-gateway.yaml")
     hermes = find_program("hermes", Path(os.environ["LOCALAPPDATA"]) / "hermes/bin/hermes.exe")
@@ -85,8 +86,11 @@ def main():
             if probe.connect_ex(("127.0.0.1", settings.port)) == 0:
                 raise RuntimeError(f"Port {settings.port} is occupied; close the other stack first")
         with (runtime / "opencode-gateway.log").open("a", encoding="utf-8") as output:
+            gateway_command = [sys.executable, "-m", "hermes_gateway.opencode_agent"]
+            if options.resume_task:
+                gateway_command += ["--resume-task", options.resume_task]
             gateway = subprocess.Popen(
-                [sys.executable, "-m", "hermes_gateway.opencode_agent"],
+                gateway_command,
                 cwd=ROOT,
                 stdout=output,
                 stderr=output,
@@ -118,9 +122,8 @@ def main():
             print(f"\nOpening Hermes with {chosen_model.removeprefix('oc-')}...\n", flush=True)
         write_hermes_home(home, endpoint + "/v1", chosen_model, 65536)
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        config[
-            "toolsets"
-        ] = []  # OpenCode executes its own tools; Hermes must not execute them again.
+        # The relay exposes memory/skills only; coding always stays in OpenCode.
+        config["toolsets"] = ["memory", "skills"] if settings.hermes_tools else []
         config["fallback_providers"] = []
         config["model"]["provider"] = "custom:opencode-agent"
         config["providers"] = {
@@ -161,6 +164,8 @@ def main():
             flush=True,
         )
         command = [hermes, "--provider", "custom:opencode-agent", "--model", chosen_model]
+        if settings.hermes_tools:
+            command += ["--toolsets", "memory,skills"]
         command += ["-z", options.prompt] if options.prompt else ["--cli"]
         stop_runtime = True
         print("Preparing the project-local Hermes runtime...", flush=True)

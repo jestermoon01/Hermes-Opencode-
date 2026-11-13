@@ -21,8 +21,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .app import MAX_BODY, error
 from .launcher import find_program
+from .model_router import ModelRouter
 from .opencode_models import discover_models, free_model, model_alias
 from .opencode_quota import OpenCodeRateLimit, QuotaGuard, native_rate_limit, quota_message
+from .task_context import TaskStore
+from .tool_relay import ToolRelay
 from .usage import UsageLog
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +39,13 @@ class AgentSettings(BaseModel):
     model: str = "opencode/deepseek-v4.1-flash-free"
     timeout_seconds: int = Field(default=600, ge=1, le=3600)
     hermes_startup_timeout_seconds: int = Field(default=300, ge=30, le=900)
+    hermes_tools: bool = False
+    task_continuity: bool = False
+    automatic_model_fallback: bool = False
+    max_model_switches: int = Field(default=2, ge=0, le=5)
+    fallback_models: list[str] = Field(default_factory=list)
+    resume_task_id: str | None = Field(default=None, exclude=True)
+    native_session_id: str | None = Field(default=None, exclude=True)
     workdir: Path = ROOT
     log_file: Path = ROOT / ".runtime/opencode-usage.jsonl"
 
@@ -54,6 +64,13 @@ class AgentSettings(BaseModel):
                 "Select an explicit OpenCode free-model ID; no paid fallback is enabled"
             )
         return value
+
+    @field_validator("fallback_models")
+    @classmethod
+    def free_fallbacks(cls, values):
+        if any(not free_model(value) for value in values):
+            raise ValueError("Fallback models must be explicit free OpenCode models")
+        return values
 
 
 def load_agent_settings(path: Path):
@@ -148,14 +165,11 @@ async def kill_agent(process):
 
 async def agent_events(settings, command, prompt):
     """Read real native JSON events as they arrive and stop the owned tree on cancellation."""
+    arguments = [command, "run", "--standalone", "--model", settings.model, "--format", "json"]
+    if settings.native_session_id:
+        arguments += ["--session", settings.native_session_id]
     process = await asyncio.create_subprocess_exec(
-        command,
-        "run",
-        "--standalone",
-        "--model",
-        settings.model,
-        "--format",
-        "json",
+        *arguments,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -174,6 +188,8 @@ async def agent_events(settings, command, prompt):
                 if not isinstance(event, dict):
                     raise ValueError("Invalid OpenCode event")
                 if event.get("type") == "error":
+                    if event.get("sessionID"):
+                        yield {"type": "bridge_session", "sessionID": event["sessionID"]}
                     limit = native_rate_limit(event)
                     if limit:
                         raise limit
@@ -188,20 +204,38 @@ async def agent_events(settings, command, prompt):
 class AgentTurn:
     def __init__(self):
         self.text = []
+        self.final_text = []
         self.tools = []
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0}
         self.usage_known = False
         self.steps = 0
+        self.model = None
 
     def accept(self, event):
         part = event.get("part") or {}
         kind = event.get("type")
+        if kind == "bridge_task":
+            return f"[OpenCode] Task checkpoint: {event['task_id']}.\n"
+        if kind == "bridge_model":
+            self.model = event["model"]
+            self.text = []
+            self.final_text = []
+            if event.get("switched"):
+                return f"[OpenCode] Continuing task with {self.model}.\n"
+            return None
+        if kind == "bridge_switch":
+            return (
+                f"[OpenCode] {event['model']} has a model-specific limit "
+                f"({event['retry_after']}s). Saving progress and selecting an available model.\n"
+            )
         if kind == "step_start":
             self.steps += 1
+            self.final_text = []
             return f"[OpenCode] Working - step {self.steps}.\n"
         if kind == "text":
             text = part.get("text", "")
             self.text.append(text)
+            self.final_text.append(text)
             return text + "\n"
         if kind == "tool_use":
             tool = str(part.get("tool", "tool"))
@@ -233,9 +267,10 @@ async def run_agent(settings, command, prompt):
     turn = AgentTurn()
     async for event in agent_events(settings, command, prompt):
         turn.accept(event)
-    if not turn.text:
+    text = turn.final_text if settings.hermes_tools else turn.text
+    if not text:
         raise RuntimeError("OpenCode returned no final text")
-    return "\n".join(turn.text), turn.usage if turn.usage_known else {}, turn.tools
+    return "\n".join(text), turn.usage if turn.usage_known else {}, turn.tools
 
 
 def subprocess_flags():
@@ -251,6 +286,10 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
     lock = asyncio.Lock()
     model_map = catalog or {model_alias(settings.model): settings.model}
     app.state.catalog = model_map
+    tasks = TaskStore(settings.log_file.parent / "tasks")
+    app.state.resume_pending = (
+        tasks.load(settings.resume_task_id, settings.workdir) if settings.resume_task_id else None
+    )
 
     @app.get("/health")
     async def health():
@@ -294,7 +333,29 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
             payload = json.loads(data)
             if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
                 raise ValueError("messages must be a list")
-            prompt = render_conversation(payload["messages"])
+            if any(not isinstance(message, dict) for message in payload["messages"]):
+                raise ValueError("Each message must be an object")
+            explicit_parent = app.state.resume_pending
+            parent = explicit_parent
+            if parent is None and (settings.task_continuity or settings.automatic_model_fallback):
+                parent = tasks.conversation_parent(payload, settings.workdir)
+            if explicit_parent:
+                current_messages = payload["messages"]
+                payload["messages"] = (
+                    [m for m in current_messages if m.get("role") in {"system", "developer"}]
+                    + [
+                        m
+                        for m in parent["payload"]["messages"]
+                        if m.get("role") not in {"system", "developer"}
+                    ]
+                    + [m for m in current_messages if m.get("role") not in {"system", "developer"}]
+                )
+            relay = ToolRelay(payload) if settings.hermes_tools else None
+            prompt = (
+                relay.render(payload["messages"])
+                if relay
+                else render_conversation(payload["messages"])
+            )
         except (ValueError, UnicodeDecodeError) as exc:
             return error(str(exc), 400)
         alias = payload.get("model", settings.alias)
@@ -304,17 +365,29 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
         if not selected:
             return error("Unknown model; choose a model from the Hermes /model picker", 404)
         selected_settings = settings.model_copy(update={"model": selected})
+        routed = settings.task_continuity or settings.automatic_model_fallback or parent is not None
+        checkpoint = tasks.start(payload, settings.workdir, parent) if routed else None
+        app.state.resume_pending = None
+        router = ModelRouter(selected_settings, model_map, quota, log, agent_events)
         request_id = "chatcmpl-" + uuid.uuid4().hex
         started = time.monotonic()
         base = {"id": request_id, "created": int(time.time()), "model": alias}
 
-        def record(status, usage, tools):
+        def record(status, usage, tools, finish_reason="stop"):
+            if checkpoint:
+                checkpoint.save(
+                    ("hermes_tool_handoff" if finish_reason == "tool_calls" else "completed")
+                    if status == "ok"
+                    else "paused_" + status
+                )
             log.write(
+                kind="request_summary" if routed else "request",
+                task_id=checkpoint.data["id"] if checkpoint else None,
                 request_id=request_id,
                 backend="opencode-agent",
-                model=selected,
+                model=checkpoint.data["model"] if checkpoint else selected,
                 status=status,
-                usage=usage,
+                usage={} if routed else usage,
                 native_tools=tools,
                 elapsed_seconds=round(time.monotonic() - started, 3),
             )
@@ -326,6 +399,7 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                 state = "client_disconnected"
                 iterator = None
                 pending = None
+                finish_reason = "stop"
 
                 def chunk(content):
                     return (
@@ -349,8 +423,13 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                 try:
                     yield chunk(f"[OpenCode] Model: {selected}. Waiting for coding agent.\n")
                     async with lock:
-                        quota.check(selected)
-                        iterator = agent_events(selected_settings, command, prompt)
+                        if not routed:
+                            quota.check(selected)
+                        iterator = (
+                            router.run(prompt, command, checkpoint)
+                            if routed
+                            else agent_events(selected_settings, command, prompt)
+                        )
                         pending = asyncio.create_task(anext(iterator))
                         while True:
                             ready, _ = await asyncio.wait({pending}, timeout=10)
@@ -364,20 +443,60 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                                 break
                             pending = None
                             content = turn.accept(event)
-                            if content:
+                            if content and not ((relay or routed) and event.get("type") == "text"):
                                 yield chunk(content)
                             pending = asyncio.create_task(anext(iterator))
-                    if not turn.text:
+                    if not (turn.final_text if relay or routed else turn.text):
                         raise RuntimeError("OpenCode returned no final text")
+                    finish_reason = "stop"
+                    if relay:
+                        message, finish_reason = relay.decode("\n".join(turn.final_text))
+                        if checkpoint and message.get("tool_calls"):
+                            tasks.link_calls(checkpoint, message["tool_calls"])
+                        if message["content"]:
+                            yield chunk(message["content"].rstrip("\n") + "\n")
+                        if message.get("tool_calls"):
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        **base,
+                                        "object": "chat.completion.chunk",
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {
+                                                    "tool_calls": [
+                                                        {"index": i, **call}
+                                                        for i, call in enumerate(
+                                                            message["tool_calls"]
+                                                        )
+                                                    ]
+                                                },
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                )
+                                + "\n\n"
+                            )
+                    elif routed:
+                        yield chunk("\n".join(turn.final_text).rstrip("\n") + "\n")
                     state = "ok"
-                    yield chunk("[OpenCode] Finished.\n")
+                    yield chunk(
+                        "[OpenCode] Handing tool request to Hermes.\n"
+                        if finish_reason == "tool_calls"
+                        else "[OpenCode] Finished.\n"
+                    )
                     yield (
                         "data: "
                         + json.dumps(
                             {
                                 **base,
                                 "object": "chat.completion.chunk",
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                "choices": [
+                                    {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                                ],
                             }
                         )
                         + "\n\n"
@@ -398,8 +517,13 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                     yield "data: [DONE]\n\n"
                 except OpenCodeRateLimit as limit:
                     state = "rate_limited"
-                    quota.record(selected, limit)
+                    if not routed:
+                        quota.record(selected, limit)
                     yield chunk(quota_message(limit))
+                    if checkpoint:
+                        yield chunk(
+                            f"[OpenCode] Resume later with -ResumeTask {checkpoint.data['id']}.\n"
+                        )
                     yield (
                         "data: "
                         + json.dumps(
@@ -418,6 +542,11 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                         "[OpenCode] The turn failed. Partial edits may exist; "
                         "no automatic retry was made.\n"
                     )
+                    if checkpoint:
+                        yield chunk(
+                            f"[OpenCode] Saved task: {checkpoint.data['id']}. "
+                            "Inspect partial work before resuming.\n"
+                        )
                     yield 'data: {"error":{"message":"OpenCode turn failed"}}\n\n'
                 finally:
                     if pending is not None:
@@ -432,33 +561,61 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                             await pending
                     if iterator is not None:
                         await iterator.aclose()
-                    record(state, turn.usage if turn.usage_known else {}, turn.tools)
+                    record(state, turn.usage if turn.usage_known else {}, turn.tools, finish_reason)
 
             return StreamingResponse(
                 sse(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
             )
         try:
             async with lock:
-                quota.check(selected)
-                text, usage, tools = await run_agent(selected_settings, command, prompt)
+                if routed:
+                    turn = AgentTurn()
+                    async for event in router.run(prompt, command, checkpoint):
+                        turn.accept(event)
+                    if not turn.final_text:
+                        raise RuntimeError("OpenCode returned no final text")
+                    text, usage, tools = (
+                        "\n".join(turn.final_text),
+                        turn.usage if turn.usage_known else {},
+                        turn.tools,
+                    )
+                else:
+                    quota.check(selected)
+                    text, usage, tools = await run_agent(selected_settings, command, prompt)
+                message, finish_reason = (
+                    relay.decode(text)
+                    if relay
+                    else ({"role": "assistant", "content": text}, "stop")
+                )
+                if checkpoint and message.get("tool_calls"):
+                    tasks.link_calls(checkpoint, message["tool_calls"])
         except OpenCodeRateLimit as limit:
-            quota.record(selected, limit)
+            if not routed:
+                quota.record(selected, limit)
             record("rate_limited", {}, [])
             response = error(quota_message(limit), 429, "rate_limit_error")
             response.headers["Retry-After"] = str(limit.retry_after)
+            if checkpoint:
+                response.headers["X-Hermes-Task-ID"] = checkpoint.data["id"]
             return response
         except RuntimeError, TimeoutError, ValueError, OSError:
             record("agent_error", {}, [])
-            return error("OpenCode could not complete the turn; no retry was made", 502)
-        record("ok", usage, tools)
+            response = error("OpenCode could not complete the turn; no retry was made", 502)
+            if checkpoint:
+                response.headers["X-Hermes-Task-ID"] = checkpoint.data["id"]
+            return response
+        except asyncio.CancelledError:
+            record("client_disconnected", {}, [])
+            raise
+        record("ok", usage, tools, finish_reason)
         return {
             **base,
             "object": "chat.completion",
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": usage,
@@ -470,8 +627,10 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=ROOT / "opencode-gateway.yaml")
+    parser.add_argument("--resume-task")
     options = parser.parse_args()
     settings = load_agent_settings(options.config)
+    settings.resume_task_id = options.resume_task
     command = find_program(
         "opencode",
         Path(os.environ["LOCALAPPDATA"])

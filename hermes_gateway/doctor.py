@@ -31,7 +31,9 @@ def main():
     if not all(flag in help_text for flag in ("--provider", "--model", "--oneshot")):
         raise RuntimeError("Installed Hermes CLI does not expose the required launch flags")
     native_help = inspect(opencode, "run", "--help")
-    if not all(flag in native_help for flag in ("--model", "--format", "--standalone")):
+    if not all(
+        flag in native_help for flag in ("--model", "--format", "--standalone", "--session")
+    ):
         raise RuntimeError("Installed OpenCode needs native run/JSON/standalone support")
     schema = json.loads(inspect(hermes, "config", "get", "_config_version", "--json"))
     if not isinstance(schema, int) or schema < 12:

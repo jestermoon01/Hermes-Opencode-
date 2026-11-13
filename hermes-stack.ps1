@@ -3,6 +3,7 @@ param(
     [string]$Prompt,
     [switch]$GatewayOnly,
     [string]$Toolsets,
+    [string]$ResumeTask,
     [switch]$OpenCode,
     [switch]$LMStudio
 )
@@ -32,6 +33,7 @@ try {
     $stackArgs = @('-m', $stackModule)
     if ($PSBoundParameters.ContainsKey('Prompt')) { $stackArgs += @('--prompt', $Prompt) }
     if ($GatewayOnly) { $stackArgs += '--gateway-only' }
+    if ($ResumeTask -and -not $LMStudio) { $stackArgs += @('--resume-task', $ResumeTask) }
     if ($Toolsets -and $LMStudio) { $stackArgs += @('--toolsets', $Toolsets) }
     & (Join-Path $stackRoot '.venv\Scripts\python.exe') @stackArgs
     $stackExitCode = $LASTEXITCODE
