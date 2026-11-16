@@ -44,6 +44,17 @@ class TaskStore:
                 json.dumps({"task_id": checkpoint.data["id"]}), encoding="utf-8"
             )
 
+    def link_answer(self, checkpoint, answer):
+        directory = self.directory / "answer-links"
+        directory.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha256(answer.strip().encode()).hexdigest()
+        path = directory / f"{key}.json"
+        try:
+            candidates = json.loads(path.read_text(encoding="utf-8"))
+        except OSError, ValueError:
+            candidates = []
+        path.write_text(json.dumps([checkpoint.data["id"], *candidates][:100]), encoding="utf-8")
+
     def conversation_parent(self, payload, workdir):
         """Follow IDs carried by this conversation, never a global 'last task'."""
         messages = payload["messages"]
@@ -60,6 +71,17 @@ class TaskStore:
                     pass
             if message.get("role") == "assistant" and isinstance(message.get("content"), str):
                 candidates.extend(reversed(CHECKPOINT_MARKER.findall(message["content"])))
+                key = hashlib.sha256(message["content"].strip().encode()).hexdigest()
+                try:
+                    candidates.extend(
+                        json.loads(
+                            (self.directory / "answer-links" / f"{key}.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                    )
+                except OSError, ValueError:
+                    pass
         current = [m for m in messages if m.get("role") not in {"system", "developer"}]
         for task_id in candidates:
             try:

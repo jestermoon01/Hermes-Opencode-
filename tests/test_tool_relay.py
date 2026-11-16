@@ -86,8 +86,9 @@ def test_memory_request_result_and_answer_round_trip(tmp_path, monkeypatch, stre
             # The control envelope must never leak into the assistant's chat text.
             text = "".join(c.get("delta", {}).get("content", "") for c in choices)
             assert "bridge_nonce" not in text
-            assert "Completed: read" in text
-            assert "Handing tool request to Hermes" in text
+            assert "[OpenCode]" not in text
+            assert "Completed: read" not in text
+            assert "Saving your preference in Hermes." in text
         else:
             choice = response.json()["choices"][0]
             assert choice["finish_reason"] == "tool_calls"

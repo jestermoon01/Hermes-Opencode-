@@ -5,6 +5,10 @@ model: opencode/deepseek-v4.1-flash-free
 timeout_seconds: 600
 hermes_startup_timeout_seconds: 300
 hermes_tools: true
+parallel_workers: true
+max_parallel_workers: 3
+max_queued_workers: 24
+display_agent_progress: false
 task_continuity: true
 automatic_model_fallback: true
 max_model_switches: 2

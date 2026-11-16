@@ -22,6 +22,51 @@ from .launcher import (
 )
 from .opencode_agent import load_agent_settings
 from .opencode_models import model_alias
+from .workers import SERVER_NAME, WORKER_TOOLS, worker_token
+
+
+def worker_state(endpoint, settings, *, require_settings=True):
+    """Authenticate a previously started project gateway before reusing it."""
+    if not settings.parallel_workers:
+        return None
+    try:
+        with httpx.Client(trust_env=False, timeout=5) as client:
+            response = client.get(
+                endpoint + "/workers/ping",
+                headers={
+                    "Authorization": "Bearer " + worker_token(settings.log_file.parent),
+                },
+            )
+            response.raise_for_status()
+            state = response.json()
+        expected = settings.model_dump(mode="json", exclude={"resume_task_id", "native_session_id"})
+        if state.get("workdir") != str(settings.workdir.resolve()):
+            return None
+        return state if not require_settings or state.get("settings") == expected else None
+    except httpx.HTTPError, ValueError, OSError:
+        return None
+
+
+def configure_worker_tools(config, settings, endpoint):
+    toolsets = ["memory", "skills"] if settings.hermes_tools else []
+    if getattr(settings, "parallel_workers", False):
+        worker_token(settings.log_file.parent)
+        config["mcp_servers"] = {
+            SERVER_NAME: {
+                "command": sys.executable,
+                "args": [str(ROOT / "hermes_gateway/worker_mcp.py")],
+                "cwd": str(ROOT),
+                "env": {
+                    "HERMES_WORKER_ENDPOINT": endpoint,
+                    "HERMES_WORKER_TOKEN_FILE": str(settings.log_file.parent / "worker-token"),
+                },
+                "tools": {"include": [item["name"] for item in WORKER_TOOLS]},
+            }
+        }
+        toolsets.append("mcp-" + SERVER_NAME)
+        config["agent"]["max_turns"] = 100
+    config["toolsets"] = toolsets
+    return toolsets
 
 
 def wait_hermes_http(origin: str, timeout: int):
@@ -72,31 +117,62 @@ def main():
     parser.add_argument("--prompt")
     parser.add_argument("--gateway-only", action="store_true")
     parser.add_argument("--resume-task")
+    parser.add_argument("--stop-gateway", action="store_true")
     options = parser.parse_args()
     settings = load_agent_settings(ROOT / "opencode-gateway.yaml")
+    endpoint = f"http://127.0.0.1:{settings.port}"
+    if options.stop_gateway:
+        if not worker_state(endpoint, settings, require_settings=False):
+            print("No matching project worker gateway is available.", file=sys.stderr)
+            return 1
+        with httpx.Client(trust_env=False, timeout=10) as client:
+            response = client.post(
+                endpoint + "/workers/shutdown",
+                headers={
+                    "Authorization": "Bearer " + worker_token(settings.log_file.parent),
+                },
+            )
+        if response.status_code != 200:
+            print(
+                "Finish or cancel active tasks before stopping the worker gateway.", file=sys.stderr
+            )
+            return 1
+        print("Project worker gateway is stopping.", flush=True)
+        return 0
     hermes = find_program("hermes", Path(os.environ["LOCALAPPDATA"]) / "hermes/bin/hermes.exe")
     runtime = ROOT / ".runtime"
     runtime.mkdir(exist_ok=True)
     gateway = hermes_process = None
     stop_runtime = False
     env = None
-    endpoint = f"http://127.0.0.1:{settings.port}"
     try:
+        reuse = False
         with socket.socket() as probe:
             if probe.connect_ex(("127.0.0.1", settings.port)) == 0:
-                raise RuntimeError(f"Port {settings.port} is occupied; close the other stack first")
-        with (runtime / "opencode-gateway.log").open("a", encoding="utf-8") as output:
+                if not worker_state(endpoint, settings):
+                    raise RuntimeError(
+                        f"Port {settings.port} is occupied by another stack or settings"
+                    )
+                reuse = True
+                print("Reconnecting to this project's background worker gateway.", flush=True)
+        if reuse and options.resume_task:
+            raise RuntimeError(
+                "ResumeTask requires a fresh gateway; worker resume uses resume_worker"
+            )
+        if not reuse:
+            output = (runtime / "opencode-gateway.log").open("a", encoding="utf-8")
             gateway_command = [sys.executable, "-m", "hermes_gateway.opencode_agent"]
             if options.resume_task:
                 gateway_command += ["--resume-task", options.resume_task]
-            gateway = subprocess.Popen(
-                gateway_command,
-                cwd=ROOT,
-                stdout=output,
-                stderr=output,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-        wait_gateway(endpoint, gateway)
+            with output:
+                gateway = subprocess.Popen(
+                    gateway_command,
+                    cwd=ROOT,
+                    stdout=output,
+                    stderr=output,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+            wait_gateway(endpoint, gateway)
         with httpx.Client(trust_env=False, timeout=10) as client:
             response = client.get(endpoint + "/v1/models")
             response.raise_for_status()
@@ -104,7 +180,11 @@ def main():
         print(f"Hermes -> {endpoint}/v1 -> OpenCode agent ({settings.model})", flush=True)
         if options.gateway_only:
             print("OpenCode agent gateway ready. Press Ctrl+C to stop.", flush=True)
-            gateway.wait()
+            if gateway:
+                gateway.wait()
+            else:
+                while worker_state(endpoint, settings):
+                    time.sleep(1)
             return 0
         home = runtime / "hermes-home"
         if existing_home_gateway(home):
@@ -122,8 +202,7 @@ def main():
             print(f"\nOpening Hermes with {chosen_model.removeprefix('oc-')}...\n", flush=True)
         write_hermes_home(home, endpoint + "/v1", chosen_model, 65536)
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        # The relay exposes memory/skills only; coding always stays in OpenCode.
-        config["toolsets"] = ["memory", "skills"] if settings.hermes_tools else []
+        toolsets = configure_worker_tools(config, settings, endpoint)
         config["fallback_providers"] = []
         config["model"]["provider"] = "custom:opencode-agent"
         config["providers"] = {
@@ -164,8 +243,8 @@ def main():
             flush=True,
         )
         command = [hermes, "--provider", "custom:opencode-agent", "--model", chosen_model]
-        if settings.hermes_tools:
-            command += ["--toolsets", "memory,skills"]
+        if toolsets:
+            command += ["--toolsets", ",".join(toolsets)]
         command += ["-z", options.prompt] if options.prompt else ["--cli"]
         stop_runtime = True
         print("Preparing the project-local Hermes runtime...", flush=True)
@@ -220,10 +299,24 @@ def main():
                     file=sys.stderr,
                 )
             except OSError as exc:
-                print(f"Hermes runtime stop failed: {exc}; gateway cleanup will continue.",
-                      file=sys.stderr)
+                print(
+                    f"Hermes runtime stop failed: {exc}; gateway cleanup will continue.",
+                    file=sys.stderr,
+                )
         if gateway is not None:
-            stop_owned_process(gateway)
+            state = (
+                worker_state(endpoint, settings)
+                if getattr(settings, "parallel_workers", False)
+                else None
+            )
+            if state and state["active"]:
+                print(
+                    "OpenCode workers are still running in the background. "
+                    "Reopen hermes-opencode.bat to reconnect.",
+                    flush=True,
+                )
+            else:
+                stop_owned_process(gateway)
 
 
 if __name__ == "__main__":

@@ -1,18 +1,19 @@
 # Hermes + OpenCode for Windows
 
-Chat in Hermes, choose an OpenCode model, and watch the coding agent's progress in the same terminal. OpenCode runs its own native file-editing and command tools. LM Studio is not required.
+Chat in Hermes, choose a free OpenCode model, and delegate independent work to parallel OpenCode workers. Hermes owns memory, skills, and worker-control tools; OpenCode runs native coding tools. LM Studio is not required.
 
 ```text
 You -> Hermes -> localhost gateway -> installed OpenCode agent -> selected model
-You <- live status, tool progress, and replies <- OpenCode
+                  Hermes worker tools -> gateway worker pool -> parallel OpenCode sessions
+You <- Hermes replies and worker results
 ```
 
 ## How a request works
 
 1. You choose a model at launch and send your task in Hermes.
-2. Hermes sends its conversation, memory context, and memory/skill tool schemas to the local gateway.
+2. Hermes sends its conversation, memory context, and enabled memory/skill/worker tool schemas to the local gateway.
 3. The gateway starts OpenCode with the selected model. OpenCode edits files and runs commands with its own tools; progress returns to Hermes.
-4. If OpenCode requests a Hermes memory or skill function, the gateway translates that request into a tool call. Hermes executes it and returns the result to OpenCode through the gateway.
+4. The gateway translates memory, skill, or worker requests into Hermes tool calls. Hermes executes memory/skills itself and invokes its project-local MCP server for worker control. Results return through the conversation.
 5. The gateway saves task context. An explicitly model-specific limit can hand unfinished work to another free model; a shared free-usage limit saves progress and stops. The final answer appears in Hermes.
 
 Hermes remains your interface and owns its memory/skills. OpenCode supplies the model connection and coding tools. The memory/skill translation is experimental; the verification section distinguishes local checks from live model tests.
@@ -58,25 +59,55 @@ A saved choice is preserved while it remains in the discovered catalog. Restart 
 
 ## Progress and tool execution
 
-Progress appears inside Hermes as native events arrive:
+Replies read as Hermes by default. A greeting produces only the conversational answer:
 
 ```text
-[OpenCode] Model: opencode/glm-5.3-flash-free. Waiting for coding agent.
-[OpenCode] Working - step 1.
-[OpenCode] Completed: write.
-[OpenCode] Working - step 2.
-[OpenCode] Completed: shell.
-Created the file and ran it. Output: 43.
-[OpenCode] Finished.
+Hey! What can I help with?
 ```
 
-Waiting updates appear every ten seconds while the native CLI is quiet. Native tool states are shown honestly; private reasoning, tool arguments, and raw terminal output are not rendered as progress. Text may arrive in blocks because this follows OpenCode's native CLI events, rather than promising token-by-token output.
+Backend banners, step counters, checkpoint IDs, and completion markers stay out of ordinary chat. SSE comments keep the connection alive without adding assistant text. Set `display_agent_progress: true` in `opencode-gateway.yaml` to restore diagnostic progress. Worker status is available through Hermes's worker tools. Private reasoning is never rendered. Replies may arrive in blocks rather than token by token.
 
 OpenCode owns coding tool execution and its normal permissions. The adapter does not pass auto-approval flags or inherit Hermes/provider keys into the OpenCode process. OpenCode uses its own normal login and configuration. The project-scope instruction is not an operating-system sandbox. Work only with projects and model providers you are authorized to use.
 
 If OpenCode reports an account-wide free-usage limit, Hermes displays it and saves a task checkpoint. The adapter records cooldowns in ignored `.runtime/opencode-quota.json`; shared limits block other free-model choices too, including after restart. An explicitly model-specific rate limit can trigger bounded continuation on another available free model. No account rotation, paid fallback, or quota bypass is performed. The startup picker can still display catalog entries while access is temporarily exhausted.
 
-Each turn uses a private OpenCode CLI run with conversation history as context. With task continuity enabled, the bridge also reuses a recorded native session when it can identify the parent turn. It matches Hermes tool-call IDs or checkpoint markers in assistant history and verifies the preceding conversation; it never uses a global "last task" shared between chats. Progress lines are removed from replayed assistant prose. The adapter supports text-only messages; outer `max_tokens` and reasoning-effort settings do not configure the native CLI. Ordinary failures do not trigger automatic coding retries; model-specific limits use the continuation rules below. Other clients can implement their own error retries.
+Each turn uses a private OpenCode CLI run with conversation history as context. With task continuity enabled, the bridge reuses a recorded native session when it can identify the parent turn. It matches Hermes tool-call IDs, locally indexed assistant answers, or legacy checkpoint markers and verifies the preceding conversation; it never uses a global "last task" shared between chats. Quiet chat therefore retains continuity. The adapter supports text-only messages; outer `max_tokens` and reasoning-effort settings do not configure the native CLI. Ordinary failures do not trigger automatic coding retries; model-specific limits use the continuation rules below.
+
+## Parallel OpenCode workers
+
+The default configuration enables three concurrent workers with a queue of up to 24 active/queued tasks:
+
+```yaml
+parallel_workers: true
+max_parallel_workers: 3
+max_queued_workers: 24
+display_agent_progress: false
+```
+
+The launcher registers a project-local stdio MCP server with Hermes. Its seven tools are `spawn_worker`, `list_workers`, `get_worker_status`, `send_worker_message`, `wait_for_workers`, `cancel_worker`, and `resume_worker`. Hermes supplies their schemas to the model through the existing validated relay. Only configured worker tools are accepted. The worker manager does not acquire the chat-turn lock: workers genuinely run concurrently while Hermes can continue answering or coordinating.
+
+For example, ask Hermes:
+
+```text
+Use two OpenCode workers in parallel: one investigates the bug, the other reviews test coverage.
+Wait for both, inspect their results, then explain the proposed fix.
+```
+
+Every worker runs the installed OpenCode CLI with its own native session. Hermes chooses an advertised free model through the optional `model` argument; omitted models use the gateway default. Workers have the same bounded model-specific fallback and shared provider cooldowns as the main conversation. Already running provider requests cannot be recalled when another worker discovers a shared limit; queued/new attempts check the shared cooldown before execution.
+
+Workers in a clean Git repository receive distinct branches and worktrees. Commit or stash pending changes first. Projects without a Git checkout receive separate source snapshots, bounded to 128 MiB/10000 files, excluding runtime directories, dependencies, symlinks, junctions, and `.env` files. Workspaces prevent accidental edit collisions; they are not operating-system sandboxes. Dependencies may need installing inside a worker workspace. Changes remain there for the orchestrator to inspect, integrate, and test; there is no automatic merge or publication.
+
+Follow-up messages are persisted and delivered at the next native turn boundary, never injected into an in-flight command. Results, progress, workspace paths, session IDs, and errors are available through status/wait tools. Waiting has a maximum of 30 seconds per tool call and does not cancel work. Workers cannot recursively spawn gateway workers. A configured worker control loop has a 100-turn budget; native turns retain `timeout_seconds`.
+
+Worker records/checkpoints persist under `.runtime/workers`. Closing Hermes leaves its gateway running when workers are active; launching `hermes-opencode.bat` again reconnects only after authenticating the same project and settings. If the gateway itself stops, unfinished workers become `interrupted` on restart and require explicit `resume_worker` after inspecting partial edits. After a forced termination, resume refuses to overlap a surviving native process with the same process identity. Completed workers accept new follow-ups. No uncertain action is automatically replayed after a restart.
+
+After tasks finish or are cancelled, stop a retained background gateway with:
+
+```powershell
+.\hermes-stack.ps1 -StopGateway
+```
+
+The worker API binds to loopback and requires a project-local capability token. The MCP subprocess reads that token from an ignored local file; credentials and runtime data are not exported. This does not change OpenCode's normal permissions or login. Windows must permit the installed Hermes executable before the complete Hermes interface can start.
 
 ## Model fallback and task continuation
 
@@ -185,6 +216,10 @@ Generated data and dependencies stay inside `.runtime`, `.tools`, `.venv`, and `
 The original integration was live-tested on Windows with Hermes 0.23.1 and OpenCode 2.2.6. DeepSeek and GLM free models replied through Hermes. An interactive Hermes model switch selected GLM, and its coding task created a Python file, ran it, and printed `43` while tool progress appeared in Hermes. Startup/model selection, SSE progress order, error handling, cancellation, and source-export boundaries have regression coverage.
 
 The memory/skill relay and continuity update passes 50 local tests and Ruff. A real Hermes CLI run against a simulated OpenCode agent completed model fallback, a native `skills_list` handoff, and the final reply; the native session ID also carried across the tool result. This verifies local plumbing, not successful live free-model inference. The latest live attempt returned a provider free-usage limit and stopped without switching around it.
+
+The parallel-worker update passes 65 local tests and Ruff. Coverage includes overlapping execution and concurrency limits, Git worktree and snapshot isolation, queued follow-ups on the same native session, cancellation, restart/resume, orphan-process detection, timeouts, shared quota handling, authenticated reconnection/shutdown, MCP transport, and quiet chat continuity. A live check using the installed Hermes MCP client started two real OpenCode workers concurrently: DeepSeek returned `WORKER_A_OK` and GLM returned `WORKER_B_OK`, each with a separate session. An earlier same-model check completed one worker while the other reached its configured timeout; provider latency and concurrency are not guaranteed.
+
+A fresh-home Hermes CLI smoke check timed out before sending any requests to the gateway, so the complete current CLI approval/orchestration flow remains unverified. A separate live greeting also timed out at the provider/native-agent boundary; quiet response formatting is covered locally. These failures are not counted as successful live checks.
 
 Setup checks required CLI flags and writes the installed version report to `.runtime/preflight.json`. `-SmokeTest` adds a real model request through Hermes and succeeds only if an exact `SETUP_OK` response line is received. A quota notice, missing login, or unavailable model fails that optional check clearly. During packaging, the clean-copy dependency/preflight checks passed, but the final live inference check encountered OpenCode's native `provider.free-limit` (429); no additional live calls were made after identifying it. Tooling and package dependencies are pinned, but remote models, their outputs, free availability, installed Hermes/OpenCode versions, and hardware are external dependencies: identical behavior can be checked, but identical generated responses on every laptop cannot be guaranteed.
 

@@ -123,7 +123,9 @@ def test_live_progress_order_and_reasoning_not_exposed(tmp_path, monkeypatch):
         yield {"type": "text", "part": {"text": "FINAL_OK"}}
 
     monkeypatch.setattr(native, "agent_events", events)
-    settings = native.AgentSettings(workdir=tmp_path, log_file=tmp_path / "usage.jsonl")
+    settings = native.AgentSettings(
+        workdir=tmp_path, log_file=tmp_path / "usage.jsonl", display_agent_progress=True
+    )
     with TestClient(native.create_agent_app(settings, "unused.exe")) as client:
         result = client.post(
             "/v1/chat/completions",
@@ -155,6 +157,7 @@ async def test_agent_events_yield_before_process_finishes_and_clean_up(tmp_path,
         return None
 
     process = SimpleNamespace(
+        pid=2147483647,
         stdout=reader,
         stdin=SimpleNamespace(write=lambda data: None, drain=done, close=lambda: None),
         returncode=None,
@@ -169,6 +172,8 @@ async def test_agent_events_yield_before_process_finishes_and_clean_up(tmp_path,
     monkeypatch.setattr(native.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(native, "kill_agent", stop)
     stream = native.agent_events(native.AgentSettings(workdir=tmp_path), "unused.exe", "Code")
+    first = await asyncio.wait_for(anext(stream), timeout=1)
+    assert first["type"] == "bridge_process"
     first = await asyncio.wait_for(anext(stream), timeout=1)
     assert first["type"] == "step_start"
     assert process.returncode is None

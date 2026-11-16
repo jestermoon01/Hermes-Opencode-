@@ -8,15 +8,17 @@ import argparse
 import asyncio
 import json
 import os
+import secrets
 import time
 import uuid
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import uvicorn
 import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from jsonschema import ValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .app import MAX_BODY, error
@@ -24,9 +26,11 @@ from .launcher import find_program
 from .model_router import ModelRouter
 from .opencode_models import discover_models, free_model, model_alias
 from .opencode_quota import OpenCodeRateLimit, QuotaGuard, native_rate_limit, quota_message
+from .processes import process_identity
 from .task_context import TaskStore
 from .tool_relay import ToolRelay
 from .usage import UsageLog
+from .workers import WORKER_TOOLS, WorkerManager, worker_token
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,6 +44,10 @@ class AgentSettings(BaseModel):
     timeout_seconds: int = Field(default=600, ge=1, le=3600)
     hermes_startup_timeout_seconds: int = Field(default=300, ge=30, le=900)
     hermes_tools: bool = False
+    parallel_workers: bool = False
+    max_parallel_workers: int = Field(default=3, ge=1, le=8)
+    max_queued_workers: int = Field(default=24, ge=1, le=64)
+    display_agent_progress: bool = False
     task_continuity: bool = False
     automatic_model_fallback: bool = False
     max_model_switches: int = Field(default=2, ge=0, le=5)
@@ -117,7 +125,9 @@ def child_environment():
 def render_conversation(messages):
     """Carry chat context, leaving tool selection/execution to OpenCode itself."""
     blocks = [
-        "You are the OpenCode coding agent receiving a conversation through the user's Hermes UI. "
+        "You are serving as Hermes, the user's assistant. Speak naturally in first person, "
+        "without backend banners or step counters. OpenCode supplies your execution backend; "
+        "explain that honestly when relevant. "
         "Use your own native coding tools when needed. Do not emit Hermes tool-call XML or "
         "ask Hermes to execute tools. Work only in the current project unless the user explicitly "
         "authorizes another location. Follow the latest user request; conversation history is "
@@ -183,6 +193,11 @@ async def agent_events(settings, command, prompt):
             process.stdin.write(prompt.encode("utf-8"))
             await process.stdin.drain()
             process.stdin.close()
+            yield {
+                "type": "bridge_process",
+                "pid": process.pid,
+                "identity": process_identity(process.pid),
+            }
             while line := await process.stdout.readline():
                 event = json.loads(line)
                 if not isinstance(event, dict):
@@ -280,16 +295,87 @@ def subprocess_flags():
 
 
 def create_agent_app(settings: AgentSettings, command: str, catalog=None):
-    app = FastAPI(title="Hermes to OpenCode coding agent")
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        if workers:
+            await workers.close()
+
+    app = FastAPI(title="Hermes to OpenCode coding agent", lifespan=lifespan)
     log = UsageLog(settings.log_file)
     quota = QuotaGuard(settings.log_file.parent / "opencode-quota.json")
     lock = asyncio.Lock()
     model_map = catalog or {model_alias(settings.model): settings.model}
+    workers = (
+        WorkerManager(settings, command, model_map, quota, log, agent_events, AgentTurn)
+        if settings.parallel_workers
+        else None
+    )
+    token = worker_token(settings.log_file.parent) if workers else None
+    app.state.workers = workers
     app.state.catalog = model_map
     tasks = TaskStore(settings.log_file.parent / "tasks")
     app.state.resume_pending = (
         tasks.load(settings.resume_task_id, settings.workdir) if settings.resume_task_id else None
     )
+
+    async def authorized(request):
+        return workers is not None and secrets.compare_digest(
+            request.headers.get("authorization", ""), "Bearer " + token
+        )
+
+    @app.get("/workers/ping")
+    async def worker_ping(request: Request):
+        if not await authorized(request):
+            return error("Worker access denied", 403)
+        return {
+            "workdir": str(settings.workdir.resolve()),
+            "active": workers.active,
+            "running": sum(record["status"] == "running" for record in workers.records.values()),
+            "peak_running": workers.peak_running,
+            "settings": settings.model_dump(
+                mode="json", exclude={"resume_task_id", "native_session_id"}
+            ),
+        }
+
+    @app.get("/workers/tools")
+    async def worker_tools(request: Request):
+        if not await authorized(request):
+            return error("Worker access denied", 403)
+        return WORKER_TOOLS
+
+    @app.post("/workers/shutdown")
+    async def worker_shutdown(request: Request):
+        if not await authorized(request):
+            return error("Worker access denied", 403)
+        if workers.active or lock.locked():
+            return error("Cancel or finish active workers and chat turns before stopping", 409)
+        shutdown = getattr(app.state, "shutdown", None)
+        if shutdown is None:
+            return error("This server does not support managed shutdown", 409)
+        asyncio.get_running_loop().call_later(0.1, shutdown)
+        return {"status": "stopping"}
+
+    @app.post("/workers/call")
+    async def worker_call(request: Request):
+        if not await authorized(request):
+            return error("Worker access denied", 403)
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > MAX_BODY:
+                return error("Worker request exceeds 8 MiB", 413)
+        try:
+            payload = json.loads(data)
+            if not isinstance(payload, dict) or not isinstance(payload.get("name"), str):
+                raise ValueError("Invalid worker request")
+            return await workers.dispatch(payload["name"], payload.get("arguments", {}))
+        except OpenCodeRateLimit as exc:
+            response = error(quota_message(exc), 429, "rate_limit_error")
+            response.headers["Retry-After"] = str(exc.retry_after)
+            return response
+        except (ValueError, ValidationError) as exc:
+            return error(str(exc)[:1500], 400)
 
     @app.get("/health")
     async def health():
@@ -350,7 +436,11 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                     ]
                     + [m for m in current_messages if m.get("role") not in {"system", "developer"}]
                 )
-            relay = ToolRelay(payload) if settings.hermes_tools else None
+            relay = (
+                ToolRelay(payload, allow_workers=settings.parallel_workers)
+                if settings.hermes_tools or settings.parallel_workers
+                else None
+            )
             prompt = (
                 relay.render(payload["messages"])
                 if relay
@@ -420,8 +510,11 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                         + "\n\n"
                     )
 
+                def status(content):
+                    return chunk(content) if settings.display_agent_progress else ": working\n\n"
+
                 try:
-                    yield chunk(f"[OpenCode] Model: {selected}. Waiting for coding agent.\n")
+                    yield status(f"[OpenCode] Model: {selected}. Waiting for coding agent.\n")
                     async with lock:
                         if not routed:
                             quota.check(selected)
@@ -434,7 +527,7 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                         while True:
                             ready, _ = await asyncio.wait({pending}, timeout=10)
                             if not ready:
-                                yield chunk("[OpenCode] Still working...\n")
+                                yield status("[OpenCode] Still working...\n")
                                 continue
                             try:
                                 event = pending.result()
@@ -444,7 +537,11 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                             pending = None
                             content = turn.accept(event)
                             if content and not ((relay or routed) and event.get("type") == "text"):
-                                yield chunk(content)
+                                yield (
+                                    chunk(content)
+                                    if event.get("type") == "text"
+                                    else status(content)
+                                )
                             pending = asyncio.create_task(anext(iterator))
                     if not (turn.final_text if relay or routed else turn.text):
                         raise RuntimeError("OpenCode returned no final text")
@@ -482,8 +579,10 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                             )
                     elif routed:
                         yield chunk("\n".join(turn.final_text).rstrip("\n") + "\n")
+                    if checkpoint and finish_reason == "stop":
+                        tasks.link_answer(checkpoint, "\n".join(turn.final_text))
                     state = "ok"
-                    yield chunk(
+                    yield status(
                         "[OpenCode] Handing tool request to Hermes.\n"
                         if finish_reason == "tool_calls"
                         else "[OpenCode] Finished.\n"
@@ -519,11 +618,9 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                     state = "rate_limited"
                     if not routed:
                         quota.record(selected, limit)
-                    yield chunk(quota_message(limit))
+                    yield chunk(quota_message(limit).removeprefix("[OpenCode] "))
                     if checkpoint:
-                        yield chunk(
-                            f"[OpenCode] Resume later with -ResumeTask {checkpoint.data['id']}.\n"
-                        )
+                        yield chunk(f"Resume later with -ResumeTask {checkpoint.data['id']}.\n")
                     yield (
                         "data: "
                         + json.dumps(
@@ -539,12 +636,11 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
                 except RuntimeError, TimeoutError, ValueError, OSError:
                     state = "agent_error"
                     yield chunk(
-                        "[OpenCode] The turn failed. Partial edits may exist; "
-                        "no automatic retry was made.\n"
+                        "The turn failed. Partial edits may exist; no automatic retry was made.\n"
                     )
                     if checkpoint:
                         yield chunk(
-                            f"[OpenCode] Saved task: {checkpoint.data['id']}. "
+                            f"Saved task: {checkpoint.data['id']}. "
                             "Inspect partial work before resuming.\n"
                         )
                     yield 'data: {"error":{"message":"OpenCode turn failed"}}\n\n'
@@ -608,6 +704,8 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
             record("client_disconnected", {}, [])
             raise
         record("ok", usage, tools, finish_reason)
+        if checkpoint and finish_reason == "stop":
+            tasks.link_answer(checkpoint, message["content"])
         return {
             **base,
             "object": "chat.completion",
@@ -636,14 +734,19 @@ def main():
         Path(os.environ["LOCALAPPDATA"])
         / "Programs/ai.opencode.desktop/resources/opencode-cli.exe",
     )
-    uvicorn.run(
-        create_agent_app(
-            settings, command, discover_models(command, child_environment(), settings.workdir)
-        ),
-        host=settings.host,
-        port=settings.port,
-        access_log=False,
+    app = create_agent_app(
+        settings, command, discover_models(command, child_environment(), settings.workdir)
     )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=settings.host,
+            port=settings.port,
+            access_log=False,
+        )
+    )
+    app.state.shutdown = lambda: setattr(server, "should_exit", True)
+    server.run()
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ def test_model_handoff_keeps_context_session_and_partial_work(tmp_path, monkeypa
         result = client.post("/v1/chat/completions", json=body(stream=stream))
     assert result.status_code == 200
     if stream:
-        assert "Continuing task with " + SECOND in result.text
+        assert "[OpenCode]" not in result.text
         assert "CONTINUED_OK" in result.text
         assert "Created task.txt; verification remains" not in result.text
         assert "data: [DONE]" in result.text

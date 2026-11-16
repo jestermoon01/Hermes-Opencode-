@@ -12,6 +12,7 @@ import httpx
 import yaml
 
 from .config import load_settings
+from .processes import process_identity
 from .programs import find_program
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,8 +86,7 @@ def existing_home_gateway(home: Path) -> bool:
     """Only inspect the PID record inside this stack's own data folder."""
     try:
         record = json.loads((home / "gateway.pid").read_text(encoding="utf-8"))
-        os.kill(int(record["pid"]), 0)
-        return True
+        return process_identity(int(record["pid"])) is not None
     except OSError, ValueError, KeyError:
         return False
 
