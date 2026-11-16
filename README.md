@@ -107,6 +107,12 @@ After tasks finish or are cancelled, stop a retained background gateway with:
 .\hermes-stack.ps1 -StopGateway
 ```
 
+Each launch automatically clears idle project gateways, including legacy gateways without worker APIs. Windows cleanup verifies both the exact project interpreter path and gateway module, includes its venv wrapper process when present, and waits for the listening port to become available. Authenticated gateways with active workers or chat turns are reconnected using their existing settings so jobs can finish; configuration changes take effect on a subsequent fresh start. Unrelated applications are never stopped automatically.
+
+Before opening the new frontend, the launcher also stops an existing project-local Hermes runtime through Hermes's own `gateway stop` command with this project's `HERMES_HOME`. This releases its runtime ports without deleting configuration, skills, or memories. The OpenCode worker pool is independent and can keep running during that frontend restart.
+
+Automatic cleanup is covered by 78 local tests. A Windows live check removed a legacy project gateway, started and authenticated its replacement, gracefully stopped that idle replacement, and confirmed the port could be bound again. The previous project-local Hermes runtime was also stopped successfully through its own CLI.
+
 The worker API binds to loopback and requires a project-local capability token. The MCP subprocess reads that token from an ignored local file; credentials and runtime data are not exported. This does not change OpenCode's normal permissions or login. Windows must permit the installed Hermes executable before the complete Hermes interface can start.
 
 ## Model fallback and task continuation
@@ -153,7 +159,7 @@ The bridge sends Hermes's system context (including injected memories and skill 
 
 When OpenCode needs a Hermes tool, it must return a specific JSON envelope. The bridge checks the request nonce, allowed function name, JSON argument schema, and tool-choice constraints, then translates it into standard OpenAI `tool_calls`, with streaming `finish_reason: tool_calls`. Hermes executes the function under its own normal storage and approval rules. Its result goes back to OpenCode on the next model turn. The bridge does not execute Hermes tools or write memory/skill files itself.
 
-Allowed functions are `memory`, `skills_list`, `skill_view`, and `skill_manage`. Unsupported function schemas are rejected rather than silently routed. Coding tools are not exposed to Hermes. Native progress continues streaming, but model answer text is buffered until the turn ends so control JSON never appears as chat text. A handoff status appears before Hermes executes a requested tool.
+Allowed functions are `memory`, `skills_list`, `skill_view`, and `skill_manage`. With parallel workers enabled, the seven worker tools and Hermes's deferred-tool bridge (`tool_search`, `tool_describe`, `tool_call`) are also supported. Nested calls remain restricted to the approved memory/skills/worker targets; worker arguments and batch limits are validated. Other function schemas are rejected rather than silently routed. Coding tools are not exposed to Hermes. Model answer text is buffered until the turn ends so control JSON never appears as chat text; diagnostic progress is optional.
 
 Try asking Hermes:
 
@@ -219,7 +225,7 @@ The memory/skill relay and continuity update passes 50 local tests and Ruff. A r
 
 The parallel-worker update passes 65 local tests and Ruff. Coverage includes overlapping execution and concurrency limits, Git worktree and snapshot isolation, queued follow-ups on the same native session, cancellation, restart/resume, orphan-process detection, timeouts, shared quota handling, authenticated reconnection/shutdown, MCP transport, and quiet chat continuity. A live check using the installed Hermes MCP client started two real OpenCode workers concurrently: DeepSeek returned `WORKER_A_OK` and GLM returned `WORKER_B_OK`, each with a separate session. An earlier same-model check completed one worker while the other reached its configured timeout; provider latency and concurrency are not guaranteed.
 
-A fresh-home Hermes CLI smoke check timed out before sending any requests to the gateway, so the complete current CLI approval/orchestration flow remains unverified. A separate live greeting also timed out at the provider/native-agent boundary; quiet response formatting is covered locally. These failures are not counted as successful live checks.
+Earlier fresh-home Hermes CLI checks timed out before sending gateway requests, and one live greeting timed out at the native-agent boundary. A later real `hermes-opencode.bat -Prompt` check exposed and fixed compatibility with Hermes's deferred-tool bridge, then completed successfully with the exact model reply `STARTUP_OK`. This verifies current CLI startup and a real reply; it does not establish reliability for every model or the complete interactive worker approval flow.
 
 Setup checks required CLI flags and writes the installed version report to `.runtime/preflight.json`. `-SmokeTest` adds a real model request through Hermes and succeeds only if an exact `SETUP_OK` response line is received. A quota notice, missing login, or unavailable model fails that optional check clearly. During packaging, the clean-copy dependency/preflight checks passed, but the final live inference check encountered OpenCode's native `provider.free-limit` (429); no additional live calls were made after identifying it. Tooling and package dependencies are pinned, but remote models, their outputs, free availability, installed Hermes/OpenCode versions, and hardware are external dependencies: identical behavior can be checked, but identical generated responses on every laptop cannot be guaranteed.
 

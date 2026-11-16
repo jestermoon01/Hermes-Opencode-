@@ -20,9 +20,58 @@ from .launcher import (
     wait_gateway,
     write_hermes_home,
 )
-from .opencode_agent import load_agent_settings
+from .opencode_agent import AgentSettings, load_agent_settings
 from .opencode_models import model_alias
+from .processes import stop_project_gateway
 from .workers import SERVER_NAME, WORKER_TOOLS, worker_token
+
+
+def port_in_use(port):
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def prepare_gateway_port(settings):
+    """Clear idle/stale project gateways; retain a busy authenticated worker pool."""
+    if not port_in_use(settings.port):
+        return None
+    endpoint = f"http://127.0.0.1:{settings.port}"
+    state = worker_state(endpoint, settings, require_settings=False)
+    if state and (state.get("active") or state.get("chat_active")):
+        print("Reconnecting to this project's active OpenCode workers.", flush=True)
+        return state["settings"]
+    if state:
+        with httpx.Client(trust_env=False, timeout=5) as client:
+            try:
+                response = client.post(
+                    endpoint + "/workers/shutdown",
+                    headers={
+                        "Authorization": "Bearer " + worker_token(settings.log_file.parent),
+                    },
+                )
+                if response.status_code == 409:
+                    # A task may have started between the status check and shutdown request.
+                    fresh = worker_state(endpoint, settings, require_settings=False)
+                    if fresh:
+                        return fresh["settings"]
+                    raise RuntimeError("Project gateway became busy; its tasks were left running")
+                response.raise_for_status()
+            except httpx.HTTPError:
+                pass
+        deadline = time.monotonic() + 5
+        while port_in_use(settings.port) and time.monotonic() < deadline:
+            time.sleep(0.1)
+    if port_in_use(settings.port):
+        print(f"Cleaning up this project's old gateway on port {settings.port}...", flush=True)
+        stop_project_gateway(settings.port, ROOT)
+    deadline = time.monotonic() + 10
+    while port_in_use(settings.port):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Port {settings.port} did not become available after cleanup")
+        time.sleep(0.1)
+    print(f"Port {settings.port} is ready for a fresh gateway.", flush=True)
+    return None
 
 
 def worker_state(endpoint, settings, *, require_settings=True):
@@ -67,6 +116,35 @@ def configure_worker_tools(config, settings, endpoint):
         config["agent"]["max_turns"] = 100
     config["toolsets"] = toolsets
     return toolsets
+
+
+def prepare_hermes_runtime(hermes, home):
+    """Use Hermes's own scoped shutdown command before starting a fresh frontend."""
+    if not existing_home_gateway(home):
+        return
+    print("Stopping the previous project-local Hermes runtime...", flush=True)
+    env = os.environ.copy()
+    env["HERMES_HOME"] = "\\\\?\\" + str(home.resolve()) if os.name == "nt" else str(home)
+    process = subprocess.Popen(
+        [hermes, "gateway", "stop"],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        process.wait(timeout=45)
+    except subprocess.TimeoutExpired as exc:
+        stop_owned_process(process)
+        raise RuntimeError(
+            "The previous project-local Hermes runtime did not stop in time"
+        ) from exc
+    deadline = time.monotonic() + 10
+    while existing_home_gateway(home):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Hermes could not stop its previous project-local runtime")
+        time.sleep(0.1)
 
 
 def wait_hermes_http(origin: str, timeout: int):
@@ -146,15 +224,11 @@ def main():
     stop_runtime = False
     env = None
     try:
-        reuse = False
-        with socket.socket() as probe:
-            if probe.connect_ex(("127.0.0.1", settings.port)) == 0:
-                if not worker_state(endpoint, settings):
-                    raise RuntimeError(
-                        f"Port {settings.port} is occupied by another stack or settings"
-                    )
-                reuse = True
-                print("Reconnecting to this project's background worker gateway.", flush=True)
+        retained_settings = prepare_gateway_port(settings)
+        reuse = retained_settings is not None
+        if reuse:
+            settings = AgentSettings.model_validate(retained_settings)
+            print("Existing settings stay in effect until active tasks finish.", flush=True)
         if reuse and options.resume_task:
             raise RuntimeError(
                 "ResumeTask requires a fresh gateway; worker resume uses resume_worker"
@@ -187,8 +261,6 @@ def main():
                     time.sleep(1)
             return 0
         home = runtime / "hermes-home"
-        if existing_home_gateway(home):
-            raise RuntimeError("This project's Hermes runtime is already running; close it first")
         config_path = home / "config.yaml"
         chosen_model = model_alias(settings.model)
         if config_path.exists():
@@ -200,6 +272,7 @@ def main():
         if options.prompt is None:
             chosen_model = choose_startup_model(model_ids, chosen_model)
             print(f"\nOpening Hermes with {chosen_model.removeprefix('oc-')}...\n", flush=True)
+        prepare_hermes_runtime(hermes, home)
         write_hermes_home(home, endpoint + "/v1", chosen_model, 65536)
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         toolsets = configure_worker_tools(config, settings, endpoint)

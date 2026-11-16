@@ -196,6 +196,158 @@ def test_mixed_protocol_output_is_not_displayed_as_a_normal_reply():
         relay.decode("Here is my request:\n" + envelope(relay.nonce))
 
 
+def test_worker_tool_discovery_is_allowed_only_with_workers_enabled():
+    payload = request(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="tool_search"):
+        ToolRelay(payload)
+    relay = ToolRelay(payload, allow_workers=True)
+    message, reason = relay.decode(
+        envelope(
+            relay.nonce,
+            tool_calls=[
+                {
+                    "name": "tool_search",
+                    "arguments": {"query": "spawn OpenCode workers"},
+                }
+            ],
+        )
+    )
+    assert reason == "tool_calls"
+    assert message["tool_calls"][0]["function"]["name"] == "tool_search"
+
+
+def deferred_payload(**overrides):
+    return request(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_describe",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "names": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["names"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_call",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "calls": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "arguments": {"type": "object"},
+                                    },
+                                    "required": ["name", "arguments"],
+                                },
+                            }
+                        },
+                        "required": ["calls"],
+                    },
+                },
+            },
+        ],
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("name", ["tool_describe", "tool_call"])
+def test_native_deferred_worker_bridge_is_supported(name):
+    from hermes_gateway.workers import PREFIX
+
+    relay = ToolRelay(deferred_payload(), allow_workers=True)
+    target = PREFIX + "spawn_worker"
+    arguments = (
+        {"names": [target]}
+        if name == "tool_describe"
+        else {
+            "calls": [{"name": target, "arguments": {"task": "Investigate"}}],
+        }
+    )
+    message, reason = relay.decode(
+        envelope(
+            relay.nonce,
+            tool_calls=[
+                {
+                    "name": name,
+                    "arguments": arguments,
+                }
+            ],
+        )
+    )
+    assert reason == "tool_calls"
+    assert message["tool_calls"][0]["function"]["name"] == name
+
+
+@pytest.mark.parametrize("name", ["tool_describe", "tool_call"])
+def test_deferred_bridge_does_not_allow_unsupported_targets(name):
+    relay = ToolRelay(deferred_payload(), allow_workers=True)
+    arguments = (
+        {"names": ["terminal"]}
+        if name == "tool_describe"
+        else {
+            "calls": [{"name": "terminal", "arguments": {"command": "whoami"}}],
+        }
+    )
+    with pytest.raises(ValueError, match="unsupported tool"):
+        relay.decode(envelope(relay.nonce, tool_calls=[{"name": name, "arguments": arguments}]))
+
+
+def test_deferred_worker_arguments_and_parallel_constraints_are_checked():
+    from hermes_gateway.workers import PREFIX
+
+    relay = ToolRelay(deferred_payload(parallel_tool_calls=False), allow_workers=True)
+    call = {"name": PREFIX + "spawn_worker", "arguments": {"task": "Investigate"}}
+    with pytest.raises(ValueError, match="count"):
+        relay.decode(
+            envelope(
+                relay.nonce,
+                tool_calls=[
+                    {
+                        "name": "tool_call",
+                        "arguments": {"calls": [call, call]},
+                    }
+                ],
+            )
+        )
+    with pytest.raises(ValueError, match="arguments"):
+        relay.decode(
+            envelope(
+                relay.nonce,
+                tool_calls=[
+                    {
+                        "name": "tool_call",
+                        "arguments": {"calls": [{**call, "arguments": {"task": 42}}]},
+                    }
+                ],
+            )
+        )
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_final_step_protocol_survives_earlier_coding_narration(tmp_path, monkeypatch, stream):
     async def events(settings, command, prompt):

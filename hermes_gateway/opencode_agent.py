@@ -331,6 +331,7 @@ def create_agent_app(settings: AgentSettings, command: str, catalog=None):
         return {
             "workdir": str(settings.workdir.resolve()),
             "active": workers.active,
+            "chat_active": lock.locked(),
             "running": sum(record["status"] == "running" for record in workers.records.values()),
             "peak_running": workers.peak_running,
             "settings": settings.model_dump(
