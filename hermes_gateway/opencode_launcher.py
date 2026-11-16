@@ -219,6 +219,9 @@ def main():
                     "Hermes runtime stop timed out; inspect its project-local logs.",
                     file=sys.stderr,
                 )
+            except OSError as exc:
+                print(f"Hermes runtime stop failed: {exc}; gateway cleanup will continue.",
+                      file=sys.stderr)
         if gateway is not None:
             stop_owned_process(gateway)
 
